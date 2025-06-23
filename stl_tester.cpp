@@ -1,0 +1,263 @@
+﻿#include <iostream>
+#include <fstream>
+#include <vector>
+#include <array>
+#include <cmath>
+#include <cfloat>
+#include <iomanip>
+#include <algorithm>
+#include "stl_reader.h"
+#include "matar.h"
+#include <Kokkos_Core.hpp>
+
+using namespace std; // Enables std::
+using namespace mtr; // MATAR
+
+KOKKOS_INLINE_FUNCTION // This function does ray-triangle intersection
+bool intersects(const double orig[3], const double dir[3],
+    const double v0[3], const double v1[3], const double v2[3]) {
+    const double EPS = 1e-8; // Small epsilon in order to avoid errors with comparisons
+    double edge1[3], edge2[3], h[3], s[3], q[3]; // Temporary vectors used for intersection test
+    for (int i = 0; i < 3; ++i) { // Computes the edges of the triangle
+        edge1[i] = v1[i] - v0[i];
+        edge2[i] = v2[i] - v0[i];
+    }
+    h[0] = dir[1] * edge2[2] - dir[2] * edge2[1]; // Cross product
+    h[1] = dir[2] * edge2[0] - dir[0] * edge2[2]; // Cross product
+    h[2] = dir[0] * edge2[1] - dir[1] * edge2[0]; // Cross product
+    double a = edge1[0] * h[0] + edge1[1] * h[1] + edge1[2] * h[2]; // Dot product
+    if (fabs(a) < EPS) return false; // If a is close to zero then then the ray is parallel to the riangle which means there is no intersection
+    double f = 1.0 / a; // Precomputes reciprocal
+    for (int i = 0; i < 3; ++i) s[i] = orig[i] - v0[i]; // Vector from the triangle vertex to the ray origin
+    double u = f * (s[0] * h[0] + s[1] * h[1] + s[2] * h[2]); // Computes the barycentric coordinate which is u
+    if (u < 0.0 || u > 1.0) return false; // If u is out of range then the intercestion is outsdide of the triangle
+    q[0] = s[1] * edge1[2] - s[2] * edge1[1]; // Cross product
+    q[1] = s[2] * edge1[0] - s[0] * edge1[2]; // Cross product
+    q[2] = s[0] * edge1[1] - s[1] * edge1[0]; // Cross product
+    double v = f * (dir[0] * q[0] + dir[1] * q[1] + dir[2] * q[2]); // Computes the barycentric coordinate which is v
+    if (v < 0.0 || u + v > 1.0) return false; // Checks if inside of the triangle
+    double t = f * (edge2[0] * q[0] + edge2[1] * q[1] + edge2[2] * q[2]); // Computes the distance t along the ray to the intersection point
+    return t > EPS; // Returns true if the intersection is ahead of the ray origin
+}
+
+bool invert_mapping_newton(const double x_target[3], // Newton-Raphson Inversion
+    const double x_nodes[8][3],
+    double xi_eta_zeta[3],
+    int max_iter = 30,
+    double tol = 1e-12) {
+    double xi = 0.0, eta = 0.0, zeta = 0.0; // Initial guess
+
+    auto phi = [](int p, double xi, double eta, double zeta) { // Defines the shape function
+            int sx = (p & 1) ? +1 : -1; // Sign of the xi derivative
+            int sy = (p & 2) ? +1 : -1; // Sign of the eta derivative
+            int sz = (p & 4) ? +1 : -1; // Sign of the zeta derivative
+            return 0.125 * (1.0 + sx * xi) * (1.0 + sy * eta) * (1.0 + sz * zeta);
+        };
+    auto dphi = [](int p, double xi, double eta, double zeta, // Define the derivatives of shape functions
+        double& dxi, double& deta, double& dzeta) {
+            int sx = (p & 1) ? +1 : -1; // Sign of the xi derivative
+            int sy = (p & 2) ? +1 : -1; // Sign of the eta derivative
+            int sz = (p & 4) ? +1 : -1; // Sign of the zeta derivative
+            dxi = 0.125 * sx * (1.0 + sy * eta) * (1.0 + sz * zeta); // Partial derivative of phi with respect to xi
+            deta = 0.125 * sy * (1.0 + sx * xi) * (1.0 + sz * zeta); // Partial derivative of phi with respect to eta
+            dzeta = 0.125 * sz * (1.0 + sx * xi) * (1.0 + sy * eta); // Partial derivative of phi with respect to zeta
+        };
+
+    for (int it = 0; it < max_iter; ++it) { // Iterative Newton method
+        double F[3] = { 0.0, 0.0, 0.0 }; // The residual vector
+        double J[3][3] = { {0.0,0.0,0.0}, // Jacobian Matrix
+                          {0.0,0.0,0.0}, // Jacobian Matrix
+                          {0.0,0.0,0.0} }; // Jacobian Matrix
+        for (int p = 0; p < 8; ++p) { // loop over all 8 nodes of the hexahedral element
+            double dxi, deta, dzeta, phi_p;
+            phi_p = phi(p, xi, eta, zeta);
+            dphi(p, xi, eta, zeta, dxi, deta, dzeta);
+
+            for (int d = 0; d < 3; ++d) { // Loop over all 3 dimensions (x,y,z)
+                F[d] += phi_p * x_nodes[p][d];
+                J[d][0] += dxi * x_nodes[p][d];
+                J[d][1] += deta * x_nodes[p][d];
+                J[d][2] += dzeta * x_nodes[p][d];
+            }
+        }
+        for (int d = 0; d < 3; ++d) F[d] -= x_target[d]; // Compute the residual
+
+        double nrm = sqrt(F[0] * F[0] + F[1] * F[1] + F[2] * F[2]); // The L2 norm
+        if (nrm < tol) { // Checks convergence, if the residual is smaller than the tolerance there is a solution
+            xi_eta_zeta[0] = xi; // Stores converged xi coordinate
+            xi_eta_zeta[1] = eta; // Stores converged eta coordinate
+            xi_eta_zeta[2] = zeta; // Stores converged zeta coordinate
+            return true; // It converged
+        }
+
+        double det = // Compute the inverse Jacoban by the determinant
+            J[0][0] * (J[1][1] * J[2][2] - J[1][2] * J[2][1]) - // Compute the inverse Jacoban by the determinant
+            J[0][1] * (J[1][0] * J[2][2] - J[1][2] * J[2][0]) + // Compute the inverse Jacoban by the determinant
+            J[0][2] * (J[1][0] * J[2][1] - J[1][1] * J[2][0]); // Compute the inverse Jacoban by the determinant
+
+        if (fabs(det) < 1e-16) return false; // Singular Jacobian matrix
+
+        double invJ[3][3]; // Declares the inverse matrix of the Jacobian matrix
+        invJ[0][0] = (J[1][1] * J[2][2] - J[1][2] * J[2][1]) / det; // Cofactor expansion for entry [0][0] of the inverse matrix
+        invJ[0][1] = (J[0][2] * J[2][1] - J[0][1] * J[2][2]) / det; // Cofactor expansion for entry [0][1] of the inverse matrix
+        invJ[0][2] = (J[0][1] * J[1][2] - J[0][2] * J[1][1]) / det; // Cofactor expansion for entry [0][2] of the inverse matrix
+
+        invJ[1][0] = (J[1][2] * J[2][0] - J[1][0] * J[2][2]) / det; // Cofactor expansion for entry [1][0] of the inverse matrix
+        invJ[1][1] = (J[0][0] * J[2][2] - J[0][2] * J[2][0]) / det; // Cofactor expansion for entry [1][1] of the inverse matrix
+        invJ[1][2] = (J[0][2] * J[1][0] - J[0][0] * J[1][2]) / det; // Cofactor expansion for entry [1][2] of the inverse matrix
+
+        invJ[2][0] = (J[1][0] * J[2][1] - J[1][1] * J[2][0]) / det; // Cofactor expansion for entry [2][0] of the inverse matrix
+        invJ[2][1] = (J[0][1] * J[2][0] - J[0][0] * J[2][1]) / det; // Cofactor expansion for entry [2][1] of the inverse matrix
+        invJ[2][2] = (J[0][0] * J[1][1] - J[0][1] * J[1][0]) / det; // Cofactor expansion for entry [2][2] of the inverse matrix
+
+        double dxi = invJ[0][0] * F[0] + invJ[0][1] * F[1] + invJ[0][2] * F[2]; // Computes the correction in the xi direction
+        double deta = invJ[1][0] * F[0] + invJ[1][1] * F[1] + invJ[1][2] * F[2]; // Computes the correction in the eta direction
+        double dzeta = invJ[2][0] * F[0] + invJ[2][1] * F[1] + invJ[2][2] * F[2]; // Computes the correction in the zeta direction
+
+        xi -= dxi; // Update xi using Newtonian step
+        eta -= deta; // Update eta using Newtonian step
+        zeta -= dzeta; // Update zeta using Newtonian step
+    }
+    return false; // There was no convergence
+}
+
+int main(int argc, char* argv[]) { // Start of the main function
+    Kokkos::initialize(argc, argv); { // Initializes Kokkos
+        stl_reader::StlMesh<float, unsigned int> mesh("/home/jbenner/MATAR/examples/Sphere.stl"); // Reads the STL file
+        const size_t n_tris = mesh.num_tris(); // Gets the number of triangles in the stl file
+        const size_t n_verts = mesh.num_vrts(); // Gets the number of vertices in the stl file
+
+        float min_x = FLT_MAX, min_y = FLT_MAX, min_z = FLT_MAX; // Compute the bounding box dimensions
+        float max_x = -FLT_MAX, max_y = -FLT_MAX, max_z = -FLT_MAX; // Compute the bounding box dimensions
+
+        for (size_t i = 0; i < n_verts; ++i) { // Loop over every vertex in the stl file
+            const float* v = mesh.vrt_coords(i); // Pointer to the coordinates of the vertex i
+            min_x = std::min(min_x, v[0]); // Update the minimum x
+            min_y = std::min(min_y, v[1]); // Update the minimum y
+            min_z = std::min(min_z, v[2]); // Update the minimum z
+            max_x = std::max(max_x, v[0]); // Update the maximum x
+            max_y = std::max(max_y, v[1]); // Update the maximum y
+            max_z = std::max(max_z, v[2]); // Update the maximum z
+        }
+        const float cx = 0.5f * (min_x + max_x); // Computes the x coordinate of the center of the bounding box
+        const float cy = 0.5f * (min_y + max_y); // Computes the y coordinate of the center of the bounding box
+        const float cz = 0.5f * (min_z + max_z); // Computes the z coordinate of the center of the bounding box
+
+        const float scale = 2.f / std::max({ max_x - min_x, max_y - min_y, max_z - min_z }); // Computes a scale factor
+
+        std::cout << std::fixed << std::setprecision(0); // setprecision(n) -> n digits after decimal point
+        std::cout << "Bounding Box Dimensions:\n"; // STL dimesnions
+        std::cout << "  Δx = " << max_x - min_x << "\n"; // STL dimensions along the x axis
+        std::cout << "  Δy = " << max_y - min_y << "\n"; // STL dimensions along the y axis
+        std::cout << "  Δz = " << max_z - min_z << "\n"; // STL dimensions along the z axis
+
+        std::vector<std::array<double, 3>> v1(n_tris), v2(n_tris), v3(n_tris); // Allocates memory for the vertices of the triangles
+        for (size_t t = 0; t < n_tris; ++t) // Loops through each triangle
+            for (int c = 0; c < 3; ++c) { // Loops through all 3 vertices of each triangle
+                const float* fv = mesh.vrt_coords(mesh.tri_corner_ind(t, c)); // Gets the coordinates of the vertices
+                std::array<double, 3> dv = { (fv[0] - cx) * scale, (fv[1] - cy) * scale, (fv[2] - cz) * scale }; // Scales and shifts vertices
+                if (c == 0) v1[t] = dv; else if (c == 1) v2[t] = dv; else v3[t] = dv;
+            }
+
+        double Lx, Ly, Lz; // Dimensions of the bounding box
+        int    Nx, Ny, Nz; // The number of voxels along each axis
+
+        std::cout << "Enter the dimensions of the bounding box  (Lx Ly Lz)  : "; // Prompts the user to enter the dimensions of the bounding box
+        std::cin >> Lx >> Ly >> Lz; // Reads the dimensions of the bounding box
+        std::cout << "Enter the the number of voxels along each axis  (Nx Ny Nz)  : "; // Prompts the user to enter the number of voxels along each axis
+        std::cin >> Nx >> Ny >> Nz; // Reads the number of voxels along each axis
+        if (Lx <= 0 || Ly <= 0 || Lz <= 0 || Nx <= 0 || Ny <= 0 || Nz <= 0) { // Validates the inputs
+            std::cerr << "Error: all lengths and counts must be positive.\n"; // Prints an error message if the user enters negative values
+            return 1;
+        }
+
+        const double hx = Lx / Nx; // Computes the spacing in x
+        const double hy = Ly / Ny; // Computes the spacing in y
+        const double hz = Lz / Nz; // Computes the spacing in z
+
+        constexpr int MAX_M = 8; // Maximum resolution of voxels per axis
+        for (int m = 1; m <= MAX_M; ++m) { // Loops over increasing voxel grid sizes and initializes counters
+
+            Kokkos::View<double***> volfrac("volfrac", Nx, Ny, Nz); // Allocates a 3D kokkos view for storing the voxel volume fractions
+            using VoxPol = Kokkos::MDRangePolicy<Kokkos::Rank<3>>; // Defines a 3D parallel loop
+            VoxPol vox_pol({ 0,0,0 }, { Nx,Ny,Nz }); // Sets loop bounds
+
+            Kokkos::parallel_for("sample_voxels", vox_pol,
+                KOKKOS_LAMBDA(const int ix, const int iy, const int iz) {
+                long long inside = 0; // Initializes the inside count for voxel
+                for (int px = 0; px < m; ++px) // Samples mxmxm subpoints
+                    for (int py = 0; py < m; ++py)
+                        for (int pz = 0; pz < m; ++pz) {
+                            const double gx = (ix + (px + 0.5) / m) / Nx; // Normalize the global x
+                            const double gy = (iy + (py + 0.5) / m) / Ny; // Normalize the global y
+                            const double gz = (iz + (pz + 0.5) / m) / Nz; // Normalize the global z
+
+                            const double xi = -1.0 + 2.0 * gx; // Maps the voxel index i to xi (centered along x axis)
+                            const double eta = -1.0 + 2.0 * gy; // Maps the voxel index j to xi (centered along y axis)
+                            const double zeta = -1.0 + 2.0 * gz; // Maps the voxel index k to xi (centered along z axis)
+
+                            double pt[3] = { xi,eta,zeta }; // Defines the point in (xi, eta, zeta)
+                            double dir[3] = { 1.0,0.0,0.0 }; // Sets the direction of the ray as the +xi direction for the inside test
+
+                            int hits = 0; // Counts the ray-triangle intersections
+                            for (size_t t = 0; t < n_tris; ++t) // Loops over the triangles
+                                if (intersects(pt, dir, v1[t].data(), v2[t].data(), v3[t].data()))++hits; // If a ray hits a triangle
+                            if (hits & 1) ++inside; // If an odd number of hits, the point is inside mesh
+                        }
+                volfrac(ix, iy, iz) = static_cast<double>(inside) / (m * m * m); // Stores tyhe volume fraction for the voxel
+            });
+
+            Kokkos::fence(); // Guarantees that all kokkos threads finish before it continues
+            auto vf_h = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), volfrac); //Copies the result for the output
+            
+            const int pts_x = Nx + 1, pts_y = Ny + 1, pts_z = Nz + 1; // The total number of grid points in every direction
+            const long long num_points = static_cast<long long>(pts_x) * pts_y * pts_z; // The total number of vertices
+            const long long num_cells = static_cast<long long>(Nx) * Ny * Nz; // The total number of hexahedral cells
+            const long long cells_size = num_cells * 9; // Every cell has 8 indices abd 1 leading count 
+            
+            std::ostringstream fname; // Creates the file name
+            fname << "voxels_m" << m << ".vtk"; // Sets the file name for the given m
+            FILE* fout = fopen(fname.str().c_str(), "w"); // Opens the ouput file
+            if (!fout) { std::perror("fopen"); return 2; } // Checks if there is an error when the file opens
+            
+            fprintf(fout, "# vtk DataFile Version 2.0\nVoxel fractions m=%d\nASCII\n", m); // Writes the VTK header
+            fprintf(fout, "DATASET UNSTRUCTURED_GRID\n"); // Declares an unstructured grid format
+            fprintf(fout, "POINTS %lld double\n", num_points); // Declares the number of points
+
+            for (int kz = 0; kz < pts_z; ++kz) // Loops over all of the points along z
+                for (int jy = 0; jy < pts_y; ++jy) // Loops over all of the points along y
+                    for (int ix = 0; ix < pts_x; ++ix) // Loops over all of the points along x
+                        fprintf(fout, "%f %f %f\n", ix * hx, jy * hy, kz * hz); // Outputs the coordinates of the points
+            
+            fprintf(fout, "\nCELLS %lld %lld\n", num_cells, cells_size); //Begins the section for cells
+            auto nid = [&](int i, int j, int k) { return k * pts_y * pts_x + j * pts_x + i; }; // Computes the global index for point i,j,k
+            for (int kz = 0; kz < Nz; ++kz) // Loop over voxels along z
+                for (int jy = 0; jy < Ny; ++jy) // Loop of over voxels along y
+                    for (int ix = 0; ix < Nx; ++ix) { // Loop over voxels along x
+                        const int p0 = nid(ix, jy, kz); // Vertex at corner 0, 0, 0
+                        const int p1 = nid(ix + 1, jy, kz); // Vertex at corner 1, 0, 0
+                        const int p2 = nid(ix + 1, jy + 1, kz); // Vertex at corner 1, 1, 0
+                        const int p3 = nid(ix, jy + 1, kz); // Vertex at corner 0, 1, 0
+                        const int p4 = nid(ix, jy, kz + 1); // Vertex at corner 0, 0, 1
+                        const int p5 = nid(ix + 1, jy, kz + 1); // Vertex at corner 1, 0, 1
+                        const int p6 = nid(ix + 1, jy + 1, kz + 1); // Vertex at corner 1, 1, 1
+                        const int p7 = nid(ix, jy + 1, kz + 1); // Vertex at corner 0, 1, 1
+                        fprintf(fout, "8 %d %d %d %d %d %d %d %d\n", p0, p1, p2, p3, p4, p5, p6, p7); // Writes the indices
+                    }
+            
+            fprintf(fout, "\nCELL_TYPES %lld\n", num_cells); // Begin of the cell type section
+            for (long long c = 0; c < num_cells; ++c) fprintf(fout, "12\n"); // VTK_HEXAHEDRON
+            
+            fprintf(fout, "\nCELL_DATA %lld\nSCALARS volume_fraction double 1\nLOOKUP_TABLE default\n", num_cells); // Writes a scalar data header
+            for (int kz = 0; kz < Nz; ++kz) // Loops over voxels along z
+                for (int jy = 0; jy < Ny; ++jy) // Loops over voxels along y
+                    for (int ix = 0; ix < Nx; ++ix) // Loops over voxels along x
+                        fprintf(fout, "%f\n", vf_h(ix, jy, kz)); // Writes the volume fraction of each voxel
+
+            fclose(fout); // Closes the generated VTK file
+            std::cout << "Created " << fname.str() << '\n'; // Prints to the console that it wrote a file for m = whatever (runs from 1 to what is defined on line 179)
+        }
+    }
+    Kokkos::finalize(); // Shut down Kokkos
+    return 0;
+}
