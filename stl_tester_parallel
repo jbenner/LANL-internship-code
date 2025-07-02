@@ -1,0 +1,497 @@
+#include <iostream>
+#include <fstream>
+#include <vector>
+#include <array>
+#include <cmath>
+#include <cfloat>
+#include <iomanip>
+#include <algorithm>
+#include "stl_reader.h"
+#include "matar.h"
+#include <Kokkos_Core.hpp>
+
+using namespace std; // Enables std::
+using namespace mtr; // MATAR
+
+KOKKOS_INLINE_FUNCTION
+bool intersects_with_edge_detect(const double* orig, const double* dir,
+    const double* v0, const double* v1, const double* v2,
+    bool& edge_hit) {
+    const double EPS = 1e-8;
+    const double EDGE_EPS = 1e-5;
+
+    double edge1[3], edge2[3], h[3], s[3], q[3];
+
+    for (int i = 0; i < 3; ++i) {
+        edge1[i] = v1[i] - v0[i];
+        edge2[i] = v2[i] - v0[i];
+    }
+
+    h[0] = dir[1] * edge2[2] - dir[2] * edge2[1];
+    h[1] = dir[2] * edge2[0] - dir[0] * edge2[2];
+    h[2] = dir[0] * edge2[1] - dir[1] * edge2[0];
+
+    double a = edge1[0] * h[0] + edge1[1] * h[1] + edge1[2] * h[2];
+    if (fabs(a) < EPS) return false;
+
+    double f = 1.0 / a;
+
+    for (int i = 0; i < 3; ++i) s[i] = orig[i] - v0[i];
+
+    double u = f * (s[0] * h[0] + s[1] * h[1] + s[2] * h[2]);
+    if (u < 0.0 || u > 1.0) return false;
+
+    q[0] = s[1] * edge1[2] - s[2] * edge1[1];
+    q[1] = s[2] * edge1[0] - s[0] * edge1[2];
+    q[2] = s[0] * edge1[1] - s[1] * edge1[0];
+
+    double v = f * (dir[0] * q[0] + dir[1] * q[1] + dir[2] * q[2]);
+    if (v < 0.0 || u + v > 1.0) return false;
+
+    double t = f * (edge2[0] * q[0] + edge2[1] * q[1] + edge2[2] * q[2]);
+    if (t <= EPS) return false;
+
+    edge_hit = (u < EDGE_EPS || u > 1.0 - EDGE_EPS ||
+        v < EDGE_EPS || v > 1.0 - EDGE_EPS ||
+        u + v > 1.0 - EDGE_EPS);
+
+    return true;
+}
+
+bool invert_mapping_newton(const ViewCArray<double>& x_target,     // [3]
+    const ViewCArray<double>& x_nodes,      // [8][3]
+    ViewCArray<double>& xi_eta_zeta,        // [3]
+    int max_iter = 30,
+    double tol = 1e-12) {
+    double xi = 0.0, eta = 0.0, zeta = 0.0;
+
+    auto phi = [](int p, double xi, double eta, double zeta) {
+        int sx = (p & 1) ? +1 : -1;
+        int sy = (p & 2) ? +1 : -1;
+        int sz = (p & 4) ? +1 : -1;
+        return 0.125 * (1.0 + sx * xi) * (1.0 + sy * eta) * (1.0 + sz * zeta);
+        };
+
+    auto dphi = [](int p, double xi, double eta, double zeta,
+        double& dxi, double& deta, double& dzeta) {
+            int sx = (p & 1) ? +1 : -1;
+            int sy = (p & 2) ? +1 : -1;
+            int sz = (p & 4) ? +1 : -1;
+            dxi = 0.125 * sx * (1.0 + sy * eta) * (1.0 + sz * zeta);
+            deta = 0.125 * sy * (1.0 + sx * xi) * (1.0 + sz * zeta);
+            dzeta = 0.125 * sz * (1.0 + sx * xi) * (1.0 + sy * eta);
+        };
+
+    for (int it = 0; it < max_iter; ++it) {
+        double F[3] = { 0.0, 0.0, 0.0 };
+        double J[3][3] = { 0.0 };
+
+        for (int p = 0; p < 8; ++p) {
+            double dxi, deta, dzeta;
+            double phi_p = phi(p, xi, eta, zeta);
+            dphi(p, xi, eta, zeta, dxi, deta, dzeta);
+
+            for (int d = 0; d < 3; ++d) {
+                F[d] += phi_p * x_nodes(p, d);
+                J[d][0] += dxi * x_nodes(p, d);
+                J[d][1] += deta * x_nodes(p, d);
+                J[d][2] += dzeta * x_nodes(p, d);
+            }
+        }
+
+        for (int d = 0; d < 3; ++d)
+            F[d] -= x_target(d);
+
+        double nrm = sqrt(F[0] * F[0] + F[1] * F[1] + F[2] * F[2]);
+        if (nrm < tol) {
+            xi_eta_zeta(0) = xi;
+            xi_eta_zeta(1) = eta;
+            xi_eta_zeta(2) = zeta;
+            return true;
+        }
+
+        double det =
+            J[0][0] * (J[1][1] * J[2][2] - J[1][2] * J[2][1]) -
+            J[0][1] * (J[1][0] * J[2][2] - J[1][2] * J[2][0]) +
+            J[0][2] * (J[1][0] * J[2][1] - J[1][1] * J[2][0]);
+
+        if (fabs(det) < 1e-16) return false;
+
+        double invJ[3][3];
+        invJ[0][0] = (J[1][1] * J[2][2] - J[1][2] * J[2][1]) / det;
+        invJ[0][1] = (J[0][2] * J[2][1] - J[0][1] * J[2][2]) / det;
+        invJ[0][2] = (J[0][1] * J[1][2] - J[0][2] * J[1][1]) / det;
+
+        invJ[1][0] = (J[1][2] * J[2][0] - J[1][0] * J[2][2]) / det;
+        invJ[1][1] = (J[0][0] * J[2][2] - J[0][2] * J[2][0]) / det;
+        invJ[1][2] = (J[0][2] * J[1][0] - J[0][0] * J[1][2]) / det;
+
+        invJ[2][0] = (J[1][0] * J[2][1] - J[1][1] * J[2][0]) / det;
+        invJ[2][1] = (J[0][1] * J[2][0] - J[0][0] * J[2][1]) / det;
+        invJ[2][2] = (J[0][0] * J[1][1] - J[0][1] * J[1][0]) / det;
+
+        double dxi = invJ[0][0] * F[0] + invJ[0][1] * F[1] + invJ[0][2] * F[2];
+        double deta = invJ[1][0] * F[0] + invJ[1][1] * F[1] + invJ[1][2] * F[2];
+        double dzeta = invJ[2][0] * F[0] + invJ[2][1] * F[1] + invJ[2][2] * F[2];
+
+        xi -= dxi;
+        eta -= deta;
+        zeta -= dzeta;
+    }
+
+    return false;
+}
+
+KOKKOS_INLINE_FUNCTION
+bool ray_intersects_aabb(const double* orig, const double* dir,
+    const double* bounds_min, const double* bounds_max) {
+    double tmin = -DBL_MAX;
+    double tmax = DBL_MAX;
+
+    for (int i = 0; i < 3; ++i) {
+        if (fabs(dir[i]) < 1e-8) {
+            if (orig[i] < bounds_min[i] || orig[i] > bounds_max[i]) return false;
+        }
+        else {
+            double invD = 1.0 / dir[i];
+            double t0 = (bounds_min[i] - orig[i]) * invD;
+            double t1 = (bounds_max[i] - orig[i]) * invD;
+            if (t0 > t1) { double tmp = t0; t0 = t1; t1 = tmp; }
+            tmin = fmax(tmin, t0);
+            tmax = fmin(tmax, t1);
+            if (tmax < tmin) return false;
+        }
+    }
+    return true;
+}
+ 
+int main(int argc, char* argv[]) { // Start of the main function
+    Kokkos::initialize(argc, argv); { // Initializes Kokkos
+        stl_reader::StlMesh<float, unsigned int> mesh("/home/jbenner/MATAR/examples/Sphere.stl");
+        const size_t n_tris = mesh.num_tris();
+        const size_t n_verts = mesh.num_vrts();
+        
+        float min_x = FLT_MAX, min_y = FLT_MAX, min_z = FLT_MAX;
+        float max_x = -FLT_MAX, max_y = -FLT_MAX, max_z = -FLT_MAX;
+        
+        for (size_t i = 0; i < n_verts; ++i) {
+            const float* v = mesh.vrt_coords(i);
+            min_x = std::min(min_x, v[0]);
+            min_y = std::min(min_y, v[1]);
+            min_z = std::min(min_z, v[2]);
+            max_x = std::max(max_x, v[0]);
+            max_y = std::max(max_y, v[1]);
+            max_z = std::max(max_z, v[2]);
+        }
+        
+        const float cx = 0.5f * (min_x + max_x);
+        const float cy = 0.5f * (min_y + max_y);
+        const float cz = 0.5f * (min_z + max_z);
+        const float scale = 2.f / std::max({ max_x - min_x, max_y - min_y, max_z - min_z });
+        
+        std::cout << std::fixed << std::setprecision(2);
+        std::cout << "Bounding Box Dimensions:\n";
+        std::cout << "  Δx = " << max_x - min_x << "\n";
+        std::cout << "  Δy = " << max_y - min_y << "\n";
+        std::cout << "  Δz = " << max_z - min_z << "\n";
+        
+        // Triangle vertex coordinates [n_tris][3]
+        CArrayKokkos<double> v1(n_tris, 3, "v1");
+        CArrayKokkos<double> v2(n_tris, 3, "v2");
+        CArrayKokkos<double> v3(n_tris, 3, "v3");
+
+        for (size_t t = 0; t < n_tris; ++t) {
+            for (int c = 0; c < 3; ++c) {
+                const float* fv = mesh.vrt_coords(mesh.tri_corner_ind(t, c));
+                const double x = (fv[0] - cx) * scale;
+                const double y = (fv[1] - cy) * scale;
+                const double z = (fv[2] - cz) * scale;
+
+                if (c == 0) {
+                    v1(t, 0) = x; v1(t, 1) = y; v1(t, 2) = z;
+                }
+                else if (c == 1) {
+                    v2(t, 0) = x; v2(t, 1) = y; v2(t, 2) = z;
+                }
+                else {
+                    v3(t, 0) = x; v3(t, 1) = y; v3(t, 2) = z;
+                }
+            }
+        }
+
+        // Triangle AABBs [n_tris][3]
+        CArrayKokkos<double> tri_min(n_tris, 3, "tri_min");
+        CArrayKokkos<double> tri_max(n_tris, 3, "tri_max");
+
+        for (size_t t = 0; t < n_tris; ++t) {
+            for (int d = 0; d < 3; ++d) {
+                tri_min(t, d) = std::min({ v1(t, d), v2(t, d), v3(t, d) });
+                tri_max(t, d) = std::max({ v1(t, d), v2(t, d), v3(t, d) });
+            }
+        }
+
+        // Grid settings
+        const int grid_res = 32;
+        const double cell_size = 2.0 / grid_res;
+
+        // Grid cell triangle lists [num_cells][variable length list]
+        const size_t num_cells = grid_res * grid_res * grid_res;
+        std::vector<std::vector<size_t>> grid_cells(num_cells); // ← (we'll MATARize this later w/ RaggedRightArray)
+
+        // Grid index lambda
+        auto grid_index = [&](int ix, int iy, int iz) -> int {
+            return iz * grid_res * grid_res + iy * grid_res + ix;
+            };
+
+        // Fill voxel index list per triangle
+        for (size_t t = 0; t < n_tris; ++t) {
+            int ix_min = std::max(0, std::min(grid_res - 1, int((tri_min(t, 0) + 1.0) * 0.5 * grid_res)));
+            int iy_min = std::max(0, std::min(grid_res - 1, int((tri_min(t, 1) + 1.0) * 0.5 * grid_res)));
+            int iz_min = std::max(0, std::min(grid_res - 1, int((tri_min(t, 2) + 1.0) * 0.5 * grid_res)));
+
+            int ix_max = std::max(0, std::min(grid_res - 1, int((tri_max(t, 0) + 1.0) * 0.5 * grid_res)));
+            int iy_max = std::max(0, std::min(grid_res - 1, int((tri_max(t, 1) + 1.0) * 0.5 * grid_res)));
+            int iz_max = std::max(0, std::min(grid_res - 1, int((tri_max(t, 2) + 1.0) * 0.5 * grid_res)));
+
+            for (int ix = ix_min; ix <= ix_max; ++ix)
+                for (int iy = iy_min; iy <= iy_max; ++iy)
+                    for (int iz = iz_min; iz <= iz_max; ++iz)
+                        grid_cells[grid_index(ix, iy, iz)].push_back(t);
+        }
+        
+        double Lx, Ly, Lz;
+        int Nx, Ny, Nz;
+        
+        std::cout << "Enter the dimensions of the bounding box  (Lx Ly Lz)  : ";
+        std::cin >> Lx >> Ly >> Lz;
+        std::cout << "Enter the the number of voxels along each axis  (Nx Ny Nz)  : ";
+        std::cin >> Nx >> Ny >> Nz;
+        
+        if (Lx <= 0 || Ly <= 0 || Lz <= 0 || Nx <= 0 || Ny <= 0 || Nz <= 0) {
+            std::cerr << "Error: all lengths and counts must be positive.\n";
+            return 1;
+        }
+        
+        const double hx = Lx / Nx;
+        const double hy = Ly / Ny;
+        const double hz = Lz / Nz;
+        
+        // Ray directions
+        const double dir_raw[3] = { 1.0, 0.371, 0.192 };
+        const double nrm1 = std::sqrt(dir_raw[0] * dir_raw[0] +
+            dir_raw[1] * dir_raw[1] +
+            dir_raw[2] * dir_raw[2]);
+        const double DIR[3] = { dir_raw[0] / nrm1, dir_raw[1] / nrm1, dir_raw[2] / nrm1 };
+
+        const double dir_alt[3] = { 0.6, 0.8, 0.3 };
+        const double nrm2 = std::sqrt(dir_alt[0] * dir_alt[0] +
+            dir_alt[1] * dir_alt[1] +
+            dir_alt[2] * dir_alt[2]);
+        const double DIR2[3] = { dir_alt[0] / nrm2, dir_alt[1] / nrm2, dir_alt[2] / nrm2 };
+
+        // Lambda: point-in-mesh check
+        auto point_inside = [&](const double pt[3]) -> bool {
+            int hits = 0;
+            for (size_t t = 0; t < n_tris; ++t) {
+                bool dummy = false;
+                if (intersects_with_edge_detect(pt, DIR,
+                    &v1(t, 0), &v2(t, 0), &v3(t, 0), dummy)) ++hits;
+            }
+            return (hits & 1);
+            };
+
+        // Subvoxel resolution levels
+        int m_vals_host[7] = {1, 2, 4, 8, 16, 32, 64};
+        ViewCArray<int> m_values(m_vals_host, 7);
+
+        // Main voxel resolution loop (over m)
+        for (int mi = 0; mi < 7; ++mi) {
+            int m = m_values(mi);
+
+            // MATAR View for volume fractions [Nx][Ny][Nz]
+            ViewFArray<double> volfrac(nullptr, Nx, Ny, Nz);
+
+            using VoxPol = Kokkos::MDRangePolicy<Kokkos::Rank<3>>;
+            VoxPol vox_pol({ 0, 0, 0 }, { Nx, Ny, Nz });
+            
+            Kokkos::parallel_for("sample_voxels", vox_pol, KOKKOS_LAMBDA(const int ix, const int iy, const int iz) {
+                bool corner_in[8];
+
+                for (int c = 0; c < 8; ++c) {
+                    const int ox = (c & 1);
+                    const int oy = (c & 2) >> 1;
+                    const int oz = (c & 4) >> 2;
+
+                    const double gx = (ix + ox) / (double)Nx;
+                    const double gy = (iy + oy) / (double)Ny;
+                    const double gz = (iz + oz) / (double)Nz;
+
+                    const double pt[3] = {
+                        -1.0 + 2.0 * gx,
+                        -1.0 + 2.0 * gy,
+                        -1.0 + 2.0 * gz
+                    };
+
+                    int hits = 0;
+                    for (size_t t = 0; t < n_tris; ++t) {
+                        if (!ray_intersects_aabb(pt, DIR,
+                            &tri_min(t, 0),
+                            &tri_max(t, 0))) continue;
+
+                        bool dummy = false;
+                        if (intersects_with_edge_detect(pt, DIR,
+                            &v1(t, 0), &v2(t, 0), &v3(t, 0), dummy)) {
+                            ++hits;
+                        }
+                    }
+
+                    corner_in[c] = (hits & 1);
+                }
+
+                bool all_in = true;
+                bool all_out = true;
+                for (int c = 0; c < 8; ++c) {
+                    all_in &= corner_in[c];
+                    all_out &= !corner_in[c];
+                }
+
+                if (all_in) {
+                    volfrac(ix, iy, iz) = 1.0;
+                    return;
+                }
+                if (all_out) {
+                    volfrac(ix, iy, iz) = 0.0;
+                    return;
+                }
+                
+                long long inside = 0;  // Initializes the inside count for voxel
+
+                for (int px = 0; px < m; ++px)
+                    for (int py = 0; py < m; ++py)
+                        for (int pz = 0; pz < m; ++pz) {
+                            const double gx = (ix + (px + 0.5) / m) / Nx;
+                            const double gy = (iy + (py + 0.5) / m) / Ny;
+                            const double gz = (iz + (pz + 0.5) / m) / Nz;
+
+                            const double xi = -1.0 + 2.0 * gx;
+                            const double eta = -1.0 + 2.0 * gy;
+                            const double zeta = -1.0 + 2.0 * gz;
+
+                            double pt[3] = { xi, eta, zeta };
+
+                            int hits = 0;
+                            bool edge_detected = false;
+
+                            for (size_t t = 0; t < n_tris; ++t) {
+                                if (!ray_intersects_aabb(pt, DIR, &tri_min(t, 0), &tri_max(t, 0))) continue;
+
+                                bool is_edge = false;
+                                if (intersects_with_edge_detect(pt, DIR,
+                                    &v1(t, 0), &v2(t, 0), &v3(t, 0), is_edge)) {
+                                    ++hits;
+                                    if (is_edge) edge_detected = true;
+                                }
+                            }
+
+                            if (edge_detected) {
+                                hits = 0;
+                                for (size_t t = 0; t < n_tris; ++t) {
+                                    bool dummy = false;
+                                    if (intersects_with_edge_detect(pt, DIR2,
+                                        &v1(t, 0), &v2(t, 0), &v3(t, 0), dummy)) {
+                                        ++hits;
+                                    }
+                                }
+                            }
+
+                            if (hits & 1) ++inside;
+                        }
+
+                volfrac(ix, iy, iz) = static_cast<double>(inside) / (m * m * m);
+            });
+            
+            Kokkos::fence(); // Ensure all kernels complete
+            auto& volf_h = volfrac;
+
+            long long total_inside = 0;
+            long long total_particles = static_cast<long long>(Nx) * Ny * Nz * m * m * m;
+
+            for (int kz = 0; kz < Nz; ++kz)
+                for (int jy = 0; jy < Ny; ++jy)
+                    for (int ix = 0; ix < Nx; ++ix)
+                        total_inside += static_cast<long long>(volf_h(ix, jy, kz) * (m * m * m));
+
+            std::cout << "\n=== Particle Statistics for m = " << m << " ===\n";
+            std::cout << "Total Particles         : " << total_particles << "\n";
+            std::cout << "Particles Inside STL    : " << total_inside << "\n";
+            std::cout << std::setprecision(10)
+                << "Volume Fraction         : " << 1.0 * total_inside / total_particles << "\n";
+
+            // Grid topology
+            const int pts_x = Nx + 1, pts_y = Ny + 1, pts_z = Nz + 1;
+            const long long num_points = static_cast<long long>(pts_x) * pts_y * pts_z;
+            const long long num_cells = static_cast<long long>(Nx) * Ny * Nz;
+            const long long cells_size = num_cells * 9; // 8 corners + 1 count
+
+            // Create file name
+            std::ostringstream fname;
+            fname << "voxels_m" << m << ".vtk";
+
+            FILE* fout = fopen(fname.str().c_str(), "w");
+            if (!fout) {
+                std::cerr << "Error opening VTK file\n";
+                return 1;
+            }
+
+            // Write VTK Header
+            fprintf(fout, "# vtk DataFile Version 2.0\nVoxel Fractions m=%d\nASCII\n", m);
+            fprintf(fout, "DATASET UNSTRUCTURED_GRID\n");
+            fprintf(fout, "POINTS %lld double\n", num_points);
+
+            // Write points
+            for (int kz = 0; kz < pts_z; ++kz)
+                for (int jy = 0; jy < pts_y; ++jy)
+                    for (int ix = 0; ix < pts_x; ++ix)
+                        fprintf(fout, "%f %f %f\n", ix * hx, jy * hy, kz * hz);
+
+            // Index map for hexahedron
+            auto nid = [&](int i, int j, int k) {
+                return k * pts_y * pts_x + j * pts_x + i;
+                };
+
+            // Write cells
+            fprintf(fout, "\nCELLS %lld %lld\n", num_cells, cells_size);
+            for (int kz = 0; kz < Nz; ++kz)
+                for (int jy = 0; jy < Ny; ++jy)
+                    for (int ix = 0; ix < Nx; ++ix) {
+                        int p0 = nid(ix, jy, kz);
+                        int p1 = nid(ix + 1, jy, kz);
+                        int p2 = nid(ix + 1, jy + 1, kz);
+                        int p3 = nid(ix, jy + 1, kz);
+                        int p4 = nid(ix, jy, kz + 1);
+                        int p5 = nid(ix + 1, jy, kz + 1);
+                        int p6 = nid(ix + 1, jy + 1, kz + 1);
+                        int p7 = nid(ix, jy + 1, kz + 1);
+                        fprintf(fout, "8 %d %d %d %d %d %d %d %d\n", p0, p1, p2, p3, p4, p5, p6, p7);
+                    }
+            // Write VTK cell types (VTK_HEXAHEDRON = 12)
+            fprintf(fout, "\nCELL_TYPES %lld\n", num_cells);
+            for (long long c = 0; c < num_cells; ++c)
+                fprintf(fout, "12\n");
+
+            // Write scalar volume fractions
+            fprintf(fout, "\nCELL_DATA %lld\nSCALARS volume_fraction double\nLOOKUP_TABLE default\n", num_cells);
+            for (int kz = 0; kz < Nz; ++kz)
+                for (int jy = 0; jy < Ny; ++jy)
+                    for (int ix = 0; ix < Nx; ++ix)
+                        fprintf(fout, "%f\n", volf_h(ix, jy, kz));
+
+            // Finalize output
+            fclose(fout);
+            std::cout << "Created " << fname.str() << '\n';
+        }
+    }
+
+    Kokkos::finalize(); // Shut down Kokkos
+    return 0;
+}
