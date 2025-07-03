@@ -129,26 +129,24 @@ bool invert_mapping_newton(const double x_target[3], // Newton-Raphson Inversion
 }
 
 KOKKOS_INLINE_FUNCTION
-bool ray_intersects_aabb(const double orig[3], const double dir[3],
-    const double bounds_min[3], const double bounds_max[3]) {
-    double tmin = -DBL_MAX;
-    double tmax = DBL_MAX;
+bool ray_intersects_aabb(const double orig[3], const double dir[3], const double bounds_min[3], const double bounds_max[3]) { // Checks if a ray intersected an axis alligned bounding box (denoted as AABB)
+    double tmin = -DBL_MAX; // Starts the minimum intersection distance as -infinity
+    double tmax = DBL_MAX; // Starts the maximum intersection distance as infinity
 
-    for (int i = 0; i < 3; ++i) {
-        if (fabs(dir[i]) < 1e-8) {
-            if (orig[i] < bounds_min[i] || orig[i] > bounds_max[i]) return false;
-        }
-        else {
-            double invD = 1.0 / dir[i];
-            double t0 = (bounds_min[i] - orig[i]) * invD;
-            double t1 = (bounds_max[i] - orig[i]) * invD;
-            if (t0 > t1) std::swap(t0, t1);
-            tmin = std::max(tmin, t0);
-            tmax = std::min(tmax, t1);
-            if (tmax < tmin) return false;
+    for (int i = 0; i < 3; ++i) { // Loops over the x, y and z axes
+        if (fabs(dir[i]) < 1e-8) { // The the ray is closely parallel to the axis
+            if (orig[i] < bounds_min[i] || orig[i] > bounds_max[i]) return false; // If the origin is outside of the box there is no intersection
+        } else {
+            double invD = 1.0 / dir[i]; // COmputes the inverse of the direction component
+            double t0 = (bounds_min[i] - orig[i]) * invD; // Distance to the close plane
+            double t1 = (bounds_max[i] - orig[i]) * invD; // Distance to the far plane
+            if (t0 > t1) std::swap(t0, t1); // Guarantees t0 is close and t1 is far
+            tmin = std::max(tmin, t0); // Updates the global entry point
+            tmax = std::min(tmax, t1); // Updates the global exit point 
+            if (tmax < tmin) return false; // No intersection if the intervals don't overlap
         }
     }
-    return true;
+    return true; // All of the axes overlap
 }
 
 int main(int argc, char* argv[]) { // Start of the main function
@@ -186,38 +184,38 @@ int main(int argc, char* argv[]) { // Start of the main function
             for (int c = 0; c < 3; ++c) { // Loops through all 3 vertices of each triangle
                 const float* fv = mesh.vrt_coords(mesh.tri_corner_ind(t, c)); // Gets the coordinates of the vertices
                 std::array<double, 3> dv = { (fv[0] - cx) * scale, (fv[1] - cy) * scale, (fv[2] - cz) * scale }; // Scales and shifts vertices
-                (c == 0 ? v1[t] : (c == 1 ? v2[t] : v3[t])) = dv;
+                (c == 0 ? v1[t] : (c == 1 ? v2[t] : v3[t])) = dv; // Assigns the converted coordinates to v1 or v2 or v3
             }
 
-        std::vector<std::array<double, 3>> tri_min(n_tris), tri_max(n_tris);
-        for (size_t t = 0; t < n_tris; ++t) {
-            for (int d = 0; d < 3; ++d) {
-                tri_min[t][d] = std::min({ v1[t][d], v2[t][d], v3[t][d] });
-                tri_max[t][d] = std::max({ v1[t][d], v2[t][d], v3[t][d] });
+        std::vector<std::array<double, 3>> tri_min(n_tris), tri_max(n_tris); // Allocates the bounding box min and max to each triangle
+        for (size_t t = 0; t < n_tris; ++t) { // Loops over every triangle
+            for (int d = 0; d < 3; ++d) { // x, y and z
+                tri_min[t][d] = std::min({ v1[t][d], v2[t][d], v3[t][d] }); // Computes the minimum of triangle t over each vertex
+                tri_max[t][d] = std::max({ v1[t][d], v2[t][d], v3[t][d] }); // Computes the maximum of triangle t over each vertex
             }
         }
 
-        const int grid_res = 32;
-        const double cell_size = 2.0 / grid_res;
+        const int grid_res = 32; // resolution of the grid along every axis
+        const double cell_size = 2.0 / grid_res; // Width of each cell in the normalized space
 
-        std::vector<std::vector<size_t>> grid_cells(grid_res * grid_res * grid_res);
+        std::vector<std::vector<size_t>> grid_cells(grid_res * grid_res * grid_res); // Every cell has a list of triangle indices which it intersects
 
-        auto grid_index = [&](int ix, int iy, int iz) -> int {
-            return iz * grid_res * grid_res + iy * grid_res + ix;
+        auto grid_index = [&](int ix, int iy, int iz) -> int { // Computes a 1d array drom 3d cell indices
+            return iz * grid_res * grid_res + iy * grid_res + ix; // Does row-major order indexing
             };
 
-        for (size_t t = 0; t < n_tris; ++t) {
-            int ix_min = std::max(0, std::min(grid_res - 1, int((tri_min[t][0] + 1.0) * 0.5 * grid_res)));
-            int iy_min = std::max(0, std::min(grid_res - 1, int((tri_min[t][1] + 1.0) * 0.5 * grid_res)));
-            int iz_min = std::max(0, std::min(grid_res - 1, int((tri_min[t][2] + 1.0) * 0.5 * grid_res)));
-            int ix_max = std::max(0, std::min(grid_res - 1, int((tri_max[t][0] + 1.0) * 0.5 * grid_res)));
-            int iy_max = std::max(0, std::min(grid_res - 1, int((tri_max[t][1] + 1.0) * 0.5 * grid_res)));
-            int iz_max = std::max(0, std::min(grid_res - 1, int((tri_max[t][2] + 1.0) * 0.5 * grid_res)));
+        for (size_t t = 0; t < n_tris; ++t) { // Loops over every triangle to figure out which grid cells overlap it
+            int ix_min = std::max(0, std::min(grid_res - 1, int((tri_min[t][0] + 1.0) * 0.5 * grid_res))); // Converts the AABB triangle x-min 
+            int iy_min = std::max(0, std::min(grid_res - 1, int((tri_min[t][1] + 1.0) * 0.5 * grid_res))); // Converts the AABB triangle y-min
+            int iz_min = std::max(0, std::min(grid_res - 1, int((tri_min[t][2] + 1.0) * 0.5 * grid_res))); // Converts the AABB triangle z-min
+            int ix_max = std::max(0, std::min(grid_res - 1, int((tri_max[t][0] + 1.0) * 0.5 * grid_res))); // Converts the AABB triangle x-max
+            int iy_max = std::max(0, std::min(grid_res - 1, int((tri_max[t][1] + 1.0) * 0.5 * grid_res))); // Converts the AABB triangle y-max
+            int iz_max = std::max(0, std::min(grid_res - 1, int((tri_max[t][2] + 1.0) * 0.5 * grid_res))); // Converts the AABB triangle z-max
 
-            for (int ix = ix_min; ix <= ix_max; ++ix)
-                for (int iy = iy_min; iy <= iy_max; ++iy)
-                    for (int iz = iz_min; iz <= iz_max; ++iz)
-                        grid_cells[grid_index(ix, iy, iz)].push_back(t);
+            for (int ix = ix_min; ix <= ix_max; ++ix) // Loops over the x-cells that the triangle spans
+                for (int iy = iy_min; iy <= iy_max; ++iy) // Loops over the y-cells that the triangle spans
+                    for (int iz = iz_min; iz <= iz_max; ++iz) // Loops over the z-cells that the triangle spans
+                        grid_cells[grid_index(ix, iy, iz)].push_back(t);  // Adds a triangle index to the overlapping triangles
         }
 
         double Lx, Ly, Lz; // Dimensions of the bounding box
@@ -237,74 +235,73 @@ int main(int argc, char* argv[]) { // Start of the main function
         const double hy = Ly / Ny; // Computes the spacing in y
         const double hz = Lz / Nz; // Computes the spacing in z
 
-        // Oblique ray direction (normalized)
-        const double dir_raw[3] = { 1.0, 0.371, 0.192 };
-        const double nrm1 = std::sqrt(dir_raw[0] * dir_raw[0] + dir_raw[1] * dir_raw[1] + dir_raw[2] * dir_raw[2]);
-        const double DIR[3] = { dir_raw[0] / nrm1, dir_raw[1] / nrm1, dir_raw[2] / nrm1 };
+        const double dir_raw[3] = { 1.0, 0.371, 0.192 }; // Direction vector for ray casting
+        const double nrm1 = std::sqrt(dir_raw[0] * dir_raw[0] + dir_raw[1] * dir_raw[1] + dir_raw[2] * dir_raw[2]); // Computes the Euclidean norm of the direction vector
+        const double DIR[3] = { dir_raw[0] / nrm1, dir_raw[1] / nrm1, dir_raw[2] / nrm1 }; // Normalizes the direction vector
 
-        const double dir_alt[3] = { 0.6, 0.8, 0.3 };
-        const double nrm2 = std::sqrt(dir_alt[0] * dir_alt[0] + dir_alt[1] * dir_alt[1] + dir_alt[2] * dir_alt[2]);
-        const double DIR2[3] = { dir_alt[0] / nrm2, dir_alt[1] / nrm2, dir_alt[2] / nrm2 };
-
-        auto point_inside = [&](const double pt[3]) -> bool { int hits = 0;
-        for (size_t t = 0; t < n_tris; ++t) {
-            bool dummy = false;
-            if (intersects_with_edge_detect(pt, DIR, v1[t].data(), v2[t].data(), v3[t].data(), dummy)) ++hits;
+        const double dir_alt[3] = { 0.6, 0.8, 0.3 }; // Alternate direction vector for secondary ray casting
+        const double nrm2 = std::sqrt(dir_alt[0] * dir_alt[0] + dir_alt[1] * dir_alt[1] + dir_alt[2] * dir_alt[2]); // Computes the Euclidean norm of the alternate direction vector
+        const double DIR2[3] = { dir_alt[0] / nrm2, dir_alt[1] / nrm2, dir_alt[2] / nrm2 }; // Normalizes the alternate direction vector
+        
+        auto point_inside = [&](const double pt[3]) -> bool { // Function to test whether a point is inside the stl
+        int hits = 0; // Counts how many times the ray intersects the triangles of the stl
+        for (size_t t = 0; t < n_tris; ++t) { // Loops over all of the triangles in the stl
+            bool dummy = false; // Dummy variable
+            if (intersects_with_edge_detect(pt, DIR, v1[t].data(), v2[t].data(), v3[t].data(), dummy)) ++hits; // Increments if the ray intersected a triangle
         }
-        return (hits & 1);
+        return (hits & 1); // Returns true if the hit count is odd
             };
 
-        std::vector<int> m_values = { 1, 2, 4, 8, 16, 32, 64 }; // Maximum resolution of voxels per axis
+        std::vector<int> m_values = { 2, 8, 16 }; // Maximum resolution of voxels per axis
+
+        Kokkos::View<int***> needs_refine("needs_refine", Nx, Ny, Nz); // 3D mask which marks the voxels that need to be sampled
+        Kokkos::deep_copy(needs_refine, 1); // Marks all the the voxels to be sampled initially
+
         for (int m : m_values) { // Loops over increasing voxel grid sizes and initializes counters
 
             Kokkos::View<double***> volfrac("volfrac", Nx, Ny, Nz); // Allocates a 3D kokkos view for storing the voxel volume fractions
-            using VoxPol = Kokkos::MDRangePolicy<Kokkos::Rank<3>>; // Defines a 3D parallel loop
-            VoxPol vox_pol({ 0,0,0 }, { Nx,Ny,Nz }); // Sets loop bounds
+            Kokkos::deep_copy(volfrac, 0.0);  // Clears old data
+
+            using VoxPol = Kokkos::MDRangePolicy<Kokkos::Rank<3>>; // Defines a 3D Kokkos range for parallel execution over the grid of voxels
+            VoxPol vox_pol({ 0,0,0 }, { Nx,Ny,Nz }); // Sets the bounds of the parallel region
 
             Kokkos::parallel_for("sample_voxels", vox_pol, KOKKOS_LAMBDA(const int ix, const int iy, const int iz) {
-                bool corner_in[8];
-                for (int c = 0; c < 8; ++c) {
-                    const int ox = (c & 1);
-                    const int oy = (c & 2) >> 1;
-                    const int oz = (c & 4) >> 2;
+                bool corner_in[8]; // An array that stores whether the 8 corners of the voxel are inside the stl
+                for (int c = 0; c < 8; ++c) { // Loops over all 8 corners of the voxel
+                    const int ox = (c & 1); // Extracts the x-offset
+                    const int oy = (c & 2) >> 1; // Extracts the y-offset
+                    const int oz = (c & 4) >> 2; // Extracts the z-offset
 
-                    const double gx = (ix + ox) / (double)Nx;
-                    const double gy = (iy + oy) / (double)Ny;
-                    const double gz = (iz + oz) / (double)Nz;
+                    const double gx = (ix + ox) / (double)Nx; // Normalized x-coordinate of the corner
+                    const double gy = (iy + oy) / (double)Ny; // Normalized y-coordinate of the corner
+                    const double gz = (iz + oz) / (double)Nz; // Normalized z-coordinate of the corner
 
                     const double pt[3] = { -1.0 + 2.0 * gx, -1.0 + 2.0 * gy, -1.0 + 2.0 * gz };
 
-                    int hits = 0;
-                    for (size_t t = 0; t < n_tris; ++t) {
-                        if (!ray_intersects_aabb(pt, DIR,
-                            tri_min[t].data(),
-                            tri_max[t].data()))
-                            continue;
-                        bool dummy = false;
-                        if (intersects_with_edge_detect(pt, DIR,
-                            v1[t].data(),
-                            v2[t].data(),
-                            v3[t].data(),
-                            dummy))
-                            ++hits;
+                    int hits = 0; // Counts how many triangles that a ray from the point intersects
+                    for (size_t t = 0; t < n_tris; ++t) { // Loops over all of the triangles in the stl
+                        if (!ray_intersects_aabb(pt, DIR, tri_min[t].data(), tri_max[t].data())) continue; // Skips the triangle if the ray doesn't intersect the bounding box 
+                        bool dummy = false; // Dummy variable
+                        if (intersects_with_edge_detect(pt, DIR, v1[t].data(), v2[t].data(), v3[t].data(), dummy)) ++hits; // If a ray hits increment the count
                     }
-                    corner_in[c] = (hits & 1);
+
+                    corner_in[c] = (hits & 1); // Uses the even-odd rule to tell if the corner is inside the mesh if it hits an odd number
                 }
 
-                bool all_in = true;
-                bool all_out = true;
+                bool all_in = true; // Flags in order to determine if the voxel is completely inside
+                bool all_out = true; // Flags in order to determine if the voxel is completely outside
+
                 for (int c = 0; c < 8; ++c) {
-                    all_in &= corner_in[c];
-                    all_out &= !corner_in[c];
+                    all_in &= corner_in[c]; // all_in becomes false if a corner is outside -> a contradiction
+                    all_out &= !corner_in[c]; // all_out becomes false if a corner is inside -> a contradiction
                 }
 
-                if (all_in) {
-                    volfrac(ix, iy, iz) = 1.0;
-                    return;
+                if (all_in) { volfrac(ix, iy, iz) = 1.0; // If all of the corners are inside -> the voxel is full
+                    return; // No more sampling is needed
                 }
-                if (all_out) {
-                    volfrac(ix, iy, iz) = 0.0;
-                    return;
+
+                if (all_out) { volfrac(ix, iy, iz) = 0.0; // If all of the corners are outside -> the voxel is empty
+                    return; // No more sampling is needed
                 }
 
                 long long inside = 0; // Initializes the inside count for voxel
@@ -323,48 +320,56 @@ int main(int argc, char* argv[]) { // Start of the main function
 
                             int hits = 0; // Counts the ray-triangle intersections
 
-                            bool edge_detected = false;
-                            for (size_t t = 0; t < n_tris; ++t) {
-                                if (!ray_intersects_aabb(pt, DIR, tri_min[t].data(), tri_max[t].data())) continue;
-                                bool is_edge = false;
-                                if (intersects_with_edge_detect(pt, DIR, v1[t].data(), v2[t].data(), v3[t].data(), is_edge)) {
-                                    ++hits;
-                                    if (is_edge) edge_detected = true;
+                            bool edge_detected = false; // Highlight whether or not the ray intersects near an edge of a triangle
+                            for (size_t t = 0; t < n_tris; ++t) { // Loop over all of the triangles in the stl mesh
+                                if (!ray_intersects_aabb(pt, DIR, tri_min[t].data(), tri_max[t].data())) continue; // Skip the triangle if the ray wasn't intersect the axis-aligned bounding box
+                                bool is_edge = false; // Temporarily highlight whether or not the intersection was near an edge
+                                if (intersects_with_edge_detect(pt, DIR, v1[t].data(), v2[t].data(), v3[t].data(), is_edge)) { // Do ray-triangle intersection with the edge detection
+                                    ++hits; // Count it as an intersection
+                                    if (is_edge) edge_detected = true; // If ray-triangle intersection was near an edge highlight it for a second go
                                 }
                             }
 
-                            if (edge_detected) {
-                                hits = 0;
-                                for (size_t t = 0; t < n_tris; ++t) {
-                                    bool dummy = false;
-                                    if (intersects_with_edge_detect(pt, DIR2, v1[t].data(), v2[t].data(), v3[t].data(), dummy)) {
-                                        ++hits;
+                            if (edge_detected) { // If ray-triangle intersection was near an edge we will recast the ray
+                                hits = 0; // Resets the hit counter
+                                for (size_t t = 0; t < n_tris; ++t) { // Loops through all triangles again using an alternate direction
+                                    bool dummy = false; // Dummy variable
+                                    if (intersects_with_edge_detect(pt, DIR2, v1[t].data(), v2[t].data(), v3[t].data(), dummy)) { // Performs ray-triangle intersection using an alternate direction
+                                        ++hits; // Counts the intersection
                                     }
                                 }
                             }
 
-                            if (hits & 1) ++inside; // If an odd number of hits, the point is inside the mesh
+                            if (hits & 1) ++inside; // If there is an odd number of hits, the point is inside the mesh
                         }
 
                 volfrac(ix, iy, iz) = static_cast<double>(inside) / (m * m * m); // Stores tyhe volume fraction for the voxel
             });
 
-            Kokkos::fence(); // Guarantees that all kokkos threads finish before it continues
-            auto vf_h = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), volfrac); //Copies the result for the output
+            Kokkos::fence(); // guarantees that all of the parallel Kokkos operations are complete before accessing the views
+            auto vf_h = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), volfrac); // Creates a mirror view of volfrac
+            auto refine_h = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), needs_refine); // Creates a mirror view of needs_refine
 
-            long long total_inside = 0;
-            long long total_particles = static_cast<long long>(Nx) * Ny * Nz * m * m * m;
+            for (int kz = 0; kz < Nz; ++kz) // Loops through all the voxel layers along the z-axis
+                for (int jy = 0; jy < Ny; ++jy) // Loops through all the voxel layers along the y-axis
+                    for (int ix = 0; ix < Nx; ++ix) // Loops through all the voxel layers along the x-axis
+                        refine_h(ix, jy, kz) = (vf_h(ix, jy, kz) > 0.0) ? 1 : 0; // Highlights the voxel if the volume fraction is > 0
 
-            for (int kz = 0; kz < Nz; ++kz)
-                for (int jy = 0; jy < Ny; ++jy)
-                    for (int ix = 0; ix < Nx; ++ix)
-                        total_inside += static_cast<long long>(vf_h(ix, jy, kz) * (m * m * m));
+            Kokkos::deep_copy(needs_refine, refine_h); // Copies the updated refinement mask for use in the next sampling pass
 
-            std::cout << "\n=== Particle Statistics for m = " << m << " ===\n";
-            std::cout << "Total Particles      : " << total_particles << "\n";
-            std::cout << "Particles Inside STL : " << total_inside << "\n";
-            std::cout << std::setprecision(10)
-                << "Volume Fraction      : " << 1.0 * total_inside / total_particles << "\n";
+            long long total_particles = static_cast<long long>(Nx) * Ny * Nz * m * m * m; // The total number of sampling points across all of the voxels at the resolution m^3
+            long long total_inside = 0; // Initializes the counter for the number of particles that fell inside the stl
+            for (int kz = 0; kz < Nz; ++kz) // Loops through all voxels along the z-axis
+                for (int jy = 0; jy < Ny; ++jy) // Loops through all voxels along the y-axis
+                    for (int ix = 0; ix < Nx; ++ix) // Loops through all voxels along the x-axis
+                        total_inside += static_cast<long long>(vf_h(ix, jy, kz) * (m * m * m)); // Converts the volume fraction to the particle count
+
+
+            std::cout << "\n=== Particle Statistics for m = " << m << " ===\n"; // Prints the start of the particle statistics for mxmxm
+            std::cout << "Total Particles      : " << total_particles << "\n"; // Prints how many particles there are total
+            std::cout << "Particles Inside STL : " << total_inside << "\n"; // Prints how many particles are inside the stl
+            std::cout << std::setprecision(10) // setprecision(n) -> n digits after the decimal point
+                << "Volume Fraction      : " << 1.0 * total_inside / total_particles << "\n"; // Prints the volume fraction
 
             const int pts_x = Nx + 1, pts_y = Ny + 1, pts_z = Nz + 1; // The total number of grid points in every direction
             const long long num_points = static_cast<long long>(pts_x) * pts_y * pts_z; // The total number of vertices
